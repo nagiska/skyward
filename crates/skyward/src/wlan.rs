@@ -45,6 +45,10 @@ const INTERFACE_WAIT: Duration = Duration::from_secs(20);
 /// How long the supplicant may take to open its control socket.
 const SOCKET_WAIT: Duration = Duration::from_secs(10);
 
+/// How long the driver is given to stop the chip once the switch is set back,
+/// before it is asked to leave the kernel.
+const PUT_AWAY_WAIT: Duration = Duration::from_millis(300);
+
 /// How long the supplicant gets to end once asked to.
 const END_WAIT: Duration = Duration::from_secs(3);
 
@@ -132,6 +136,17 @@ impl Worker {
             }
         }
         (wlan, traffic)
+    }
+}
+
+impl Worker {
+    /// Put the radio away now, and wait for the thread to have done it: the
+    /// thread is the only one that can stop the chip's firmware and take the
+    /// driver out of the kernel. The drop below sends the end again and waits
+    /// for the thread, which is what makes the put-away complete before a
+    /// caller goes on to restart the phone.
+    pub fn stop(self) {
+        self.inbox.tell(Inbox::End);
     }
 }
 
@@ -334,11 +349,17 @@ impl Station {
 
     fn off(&mut self) {
         self.unaddress();
+        // Whether there is a driver to take out at all: a WLAN that never
+        // came up has nothing to put away, and its switch need not be there.
+        let driving = self.running.is_some() || Path::new("/sys/class/net").join(&self.cfg.interface).exists();
         if let Some(mut r) = self.running.take() {
             end(&mut r.child, Some(&r.control));
         }
         if let Err(e) = iface::set_up(&self.cfg.interface, false) {
             let _ = skyward_sys::kmsg(&format!("{e:#}"));
+        }
+        if driving {
+            put_away(&self.cfg);
         }
         self.state = Wlan::default();
     }
@@ -617,6 +638,45 @@ impl Station {
         }
         link.speed = fields.get("LINKSPEED").and_then(|v| v.parse().ok());
         link.generation = supplicant::fields(&status).get("wifi_generation").and_then(|v| v.parse().ok());
+    }
+}
+
+/// Put the radio away the way the phone's own init does as it goes down: the
+/// switch the start set set back the other way, which has the driver stop the
+/// chip's firmware, and then the driver itself out of the kernel. A chip left
+/// running is one the system's own driver finds already up when it boots: it
+/// will not start it cold, no interface appears, and the WLAN stays dead
+/// until the phone loses power. Nothing here may fail the WLAN's own ending,
+/// so a switch that will not take its value and a module the kernel will not
+/// let go are said, and no more.
+fn put_away(cfg: &Config) {
+    for w in &cfg.release {
+        if let Err(e) = fs::write(&w.path, &w.value) {
+            let _ = skyward_sys::kmsg(&format!("{} is not given {}: {e}", w.path, w.value));
+        }
+    }
+    if !cfg.release.is_empty() {
+        thread::sleep(PUT_AWAY_WAIT);
+    }
+    let mut why = None;
+    for attempt in 0..3 {
+        match skyward_modules::unload(&cfg.modules) {
+            Ok(gone) => {
+                if !gone.is_empty() {
+                    let _ = skyward_sys::kmsg(&format!("{} left the kernel", gone.join(", ")));
+                }
+                return;
+            }
+            Err(e) => {
+                why = Some(format!("{e:#}"));
+                if attempt < 2 {
+                    thread::sleep(PUT_AWAY_WAIT);
+                }
+            }
+        }
+    }
+    if let Some(why) = why {
+        let _ = skyward_sys::kmsg(&format!("the driver stays in the kernel: {why}"));
     }
 }
 

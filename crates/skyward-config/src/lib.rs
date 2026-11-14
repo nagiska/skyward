@@ -110,6 +110,11 @@ pub struct Wlan {
     /// what tells a platform driver it may start the chip.
     #[serde(default)]
     pub writes: Vec<Write>,
+    /// What is written when the WLAN is put away, each value to its file:
+    /// the switch above set back, so that the driver stops the chip rather
+    /// than leaving it running for whatever the phone boots next.
+    #[serde(default)]
+    pub release: Vec<Write>,
     /// Files the driver asks the kernel's firmware loader for that are not
     /// where the loader looks in a recovery.
     #[serde(default)]

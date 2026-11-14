@@ -189,6 +189,19 @@ fn power(target: Target) -> Result<()> {
     })
 }
 
+/// Put the radio away before the recovery stops.
+///
+/// The WLAN's thread is told to end, and it ends by setting the switch the
+/// start set back, letting the chip go of its firmware, and taking the driver
+/// out of the kernel. A chip left running is one the system's own driver finds
+/// already up as it boots and will not start cold: no interface appears, the
+/// WLAN stays dead until the phone loses its power.
+fn put_radio_away(wlan: &mut Option<wlan::Worker>) {
+    if let Some(worker) = wlan.take() {
+        worker.stop();
+    }
+}
+
 /// File transfer: the service offering internal storage to a computer over
 /// USB, whether it offers the storage now, and the zone, by its place in
 /// the settings, it tells the times of files in.
@@ -1558,6 +1571,7 @@ impl<'a> Pages<'a> {
         let now = monotonic_ms();
         if self.leave_at.is_some_and(|at| now >= at) {
             self.leave_at = None;
+            put_radio_away(&mut self.wlan);
             power(self.leave)?;
         }
         if !self.touch_known && self.started.elapsed() >= TOUCH_WAIT {
@@ -1931,6 +1945,7 @@ impl Pages<'_> {
                     if again {
                         bcb::write(&self.misc, &bcb::Bcb { command: "boot-rescue".into(), args: Vec::new() })?;
                     }
+                    put_radio_away(&mut self.wlan);
                     power(target)?;
                 }
             }
@@ -2164,6 +2179,7 @@ impl Pages<'_> {
                     }
                     self.switch_asked = false;
                     self.switched = true;
+                    put_radio_away(&mut self.wlan);
                     power(Target::System)?;
                 }
                 systems::Event::Failed(why) => {
@@ -2480,6 +2496,10 @@ impl Pages<'_> {
             // still kept in misc asked.
             Effect::Reboot(target) => {
                 self.done_with_request()?;
+                // The radio goes away before the phone does: a chip left
+                // running is one the system's own driver finds already up as
+                // it boots and will not start cold.
+                put_radio_away(&mut self.wlan);
                 power(target)?
             }
             Effect::Dismiss => self.done_with_request()?,
