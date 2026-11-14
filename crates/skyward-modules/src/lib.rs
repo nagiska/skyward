@@ -21,10 +21,14 @@ pub fn source_dir(source: &str) -> Result<PathBuf> {
 
 /// Load `names` (module names without `.ko`) with their dependencies. Each
 /// comes from the first of `dirs` that holds it, and its dependencies from
-/// that directory's modules.dep; a module the kernel already has counts as
-/// loaded. Returns the files loaded, dependencies first.
+/// whichever directory holds them: a phone keeps one driver in the vendor
+/// partition and the parts of the kernel it is built on in the ramdisk, so a
+/// single directory holds neither the whole of a driver nor everything it
+/// needs. A module the kernel already has counts as loaded. Returns the files
+/// loaded, dependencies first.
 pub fn load(dirs: &[PathBuf], names: &[String]) -> Result<Vec<PathBuf>> {
     let mut loaded = Vec::new();
+    let mut done = BTreeSet::new();
     for name in names {
         let file = format!("{name}.ko");
         let dir = dirs
@@ -33,14 +37,24 @@ pub fn load(dirs: &[PathBuf], names: &[String]) -> Result<Vec<PathBuf>> {
             .ok_or_else(|| anyhow!("{file} is in none of {dirs:?}"))?;
         let graph = parse_dep(dir)?;
         for m in graph.load_order(std::slice::from_ref(&file)) {
-            let path = graph
-                .resolve_path(&m)
-                .ok_or_else(|| anyhow!("{m} is listed in {}/modules.dep but missing", dir.display()))?;
+            if !done.insert(m.clone()) {
+                continue;
+            }
+            // The graph knows where the module it named lists its own parts,
+            // which is not always where this one came from.
+            let path = graph.resolve_path(&m).or_else(|| elsewhere(dirs, &m));
+            let path = path.with_context(|| format!("{m} is listed in {}/modules.dep but is in no source", dir.display()))?;
             insmod(&path, "")?;
             loaded.push(path);
         }
     }
     Ok(loaded)
+}
+
+/// A module file in any of `dirs`, for one a directory's own graph names but
+/// does not hold.
+fn elsewhere(dirs: &[PathBuf], file: &str) -> Option<PathBuf> {
+    dirs.iter().map(|d| d.join(file)).find(|p| p.is_file())
 }
 
 /// A `modules.dep` graph: each module file mapped to the module files it
@@ -135,32 +149,98 @@ fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
     None
 }
 
-/// Hand the open module `file` to the kernel with the settings `params`.
+/// Hand the open module `file`, whose path is `path`, to the kernel with the
+/// settings `params`.
 #[cfg(target_os = "android")]
-fn finit_module(file: &fs::File, params: &str) -> std::io::Result<()> {
+fn finit_module(file: &fs::File, path: &Path, params: &str) -> std::io::Result<()> {
     use std::os::unix::io::AsRawFd;
-    let params = std::ffi::CString::new(params).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let rc = unsafe { libc::syscall(libc::SYS_finit_module, file.as_raw_fd(), params.as_ptr(), 0 as libc::c_int) };
+    // The phone's modules in vendor_dlkm are built with a different compiler
+    // stamp than the recovery kernel -- 6.6.57 where the kernel is 6.6.118 --
+    // and this kernel has no CONFIG_MODULE_FORCE_LOAD, so the
+    // MODULE_INIT_IGNORE_* flags mean nothing to it. The phone's own init
+    // loads them all the same, and /proc/modules marks them (O).
+    //
+    // init_module is the call that does load them: the toybox insmod on this
+    // phone uses it, and loading the touchscreen's drivers through it
+    // succeeded where finit_module answered ENOEXEC. It takes the module's
+    // bytes rather than the open file; finit_module stays as the fallback for
+    // a module it might take and this one refuse.
+    let bytes = fs::read(path).map_err(|e| std::io::Error::new(e.kind(), format!("read {}: {e}", path.display())))?;
+    let cparams = std::ffi::CString::new(params)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let rc = unsafe { libc::syscall(libc::SYS_init_module, bytes.as_ptr(), bytes.len(), cparams.as_ptr()) };
+    if rc == 0 {
+        return Ok(());
+    }
+    let first = std::io::Error::last_os_error();
+    if first.raw_os_error() == Some(libc::EEXIST) {
+        return Ok(());
+    }
+    let rc = unsafe { libc::syscall(libc::SYS_finit_module, file.as_raw_fd(), cparams.as_ptr(), 0 as libc::c_int) };
     if rc != 0 {
-        return Err(std::io::Error::last_os_error());
+        let second = std::io::Error::last_os_error();
+        if second.raw_os_error() == Some(libc::EEXIST) {
+            return Ok(());
+        }
+        return Err(std::io::Error::new(
+            second.kind(),
+            format!("load {} (init_module said {first}, finit_module said otherwise)", path.display()),
+        ));
     }
     Ok(())
 }
 
 #[cfg(not(target_os = "android"))]
-fn finit_module(_file: &fs::File, _params: &str) -> std::io::Result<()> {
+fn finit_module(_file: &fs::File, _path: &Path, _params: &str) -> std::io::Result<()> {
     Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "modules are loaded only on the phone"))
 }
 
 pub fn insmod(path: impl AsRef<Path>, params: &str) -> Result<()> {
     let path = path.as_ref();
     let f = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-    match finit_module(&f, params) {
+    match finit_module(&f, path, params) {
         Ok(()) => Ok(()),
         // Already loaded is success for our purposes.
         Err(e) if e.raw_os_error() == Some(libc::EEXIST) => Ok(()),
         Err(e) => Err(e).with_context(|| format!("finit_module {}", path.display())),
     }
+}
+
+/// Take `names` out of the kernel again, the last loaded first: a module does
+/// not go while another is built on it. A module the kernel does not have is
+/// not an error, as two starts of the recovery service share one kernel and
+/// the driver is only taken out once. Returns the modules that came out.
+pub fn unload(names: &[String]) -> Result<Vec<String>> {
+    let mut gone = Vec::new();
+    for name in names.iter().rev() {
+        if removed(name)? {
+            gone.push(name.clone());
+        }
+    }
+    Ok(gone)
+}
+
+/// Have the kernel drop the module `name`.
+#[cfg(target_os = "android")]
+fn removed(name: &str) -> Result<bool> {
+    let cname = std::ffi::CString::new(name).map_err(|e| anyhow!("{name} is no module's name: {e}"))?;
+    // Not waited on: a module still in use then answers at once instead of
+    // holding the caller until its user lets go, which is a recovery that
+    // never restarts.
+    let rc = unsafe { libc::syscall(libc::SYS_delete_module, cname.as_ptr(), libc::O_NONBLOCK as libc::c_int) };
+    if rc == 0 {
+        return Ok(true);
+    }
+    let e = std::io::Error::last_os_error();
+    if e.raw_os_error() == Some(libc::ENOENT) {
+        return Ok(false);
+    }
+    Err(anyhow!("{name} is still in the kernel: {e}"))
+}
+
+#[cfg(not(target_os = "android"))]
+fn removed(_name: &str) -> Result<bool> {
+    bail!("modules are loaded only on the phone")
 }
 
 #[cfg(test)]
