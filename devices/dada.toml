@@ -84,7 +84,11 @@ writes = [{ path = "/sys/bus/platform/devices/b0000000.qcom,cnss-peach/fs_ready"
 # boot and WLAN stays dead until a power cycle.
 release = [{ path = "/sys/bus/platform/devices/b0000000.qcom,cnss-peach/fs_ready", value = "0" }]
 firmware = [
-    { name = "wlan/qca_cld/peach_v2/WCNSS_qcom_cfg.ini", path = "/vendor/etc/wifi/peach_v2/WCNSS_qcom_cfg.ini" },
+    # The stock settings wait for the system's own init to start
+    # wpa_supplicant; the recovery starts it itself, after the driver, so the
+    # chip would otherwise power down before any interface is opened. Let it
+    # wait for the recovery instead.
+    { name = "wlan/qca_cld/peach_v2/WCNSS_qcom_cfg.ini", path = "/vendor/etc/wifi/peach_v2/WCNSS_qcom_cfg.ini", settings = [{ name = "gInterfaceChangeWait", value = "0" }] },
     { name = "wlan/qca_cld/peach_v2/wlan_mac.bin", partition = "persist", path = "wlan/wlan_mac.bin" },
 ]
 interface = "wlan0"
