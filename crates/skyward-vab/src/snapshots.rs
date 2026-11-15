@@ -1039,4 +1039,63 @@ mod tests {
         assert!(shared.write_update(&begun, &tell).is_err(), "a shared lock writes nothing");
         fs::remove_dir_all(&dir).unwrap();
     }
+
+    #[test]
+    fn a_failed_update_is_given_up_and_one_that_is_merging_is_not() {
+        let dir = scratch("discard");
+        let snaps = Snapshots::lock_in(&dir, true).unwrap();
+        let write_state = |s: UpdateState| {
+            fs::write(dir.join(STATE), UpdateStatus { state: s as i32, ..UpdateStatus::default() }.encode_to_vec()).unwrap();
+        };
+        let written = SnapshotStatus {
+            name: "system_b".into(),
+            state: PartState::Created as i32,
+            device_size: 4096,
+            snapshot_size: 4096,
+            cow_partition_size: 65_536,
+            ..SnapshotStatus::default()
+        };
+        snaps.write_status(&written).unwrap();
+        fs::write(dir.join(SOURCE), "_a").unwrap();
+        fs::write(dir.join(WITHOUT_SLOT_SWITCH), "").unwrap();
+        let cow = dir.join("data/gsi/ota");
+        let images = dir.join("metadata/gsi/ota/lp_metadata");
+        fs::create_dir_all(&cow).unwrap();
+        fs::create_dir_all(images.parent().unwrap()).unwrap();
+        fs::write(cow.join("system_b-cow.img"), b"cow").unwrap();
+        fs::write(&images, b"images").unwrap();
+        let taken = std::cell::RefCell::new(Vec::new());
+        let apart = |name: &str| {
+            taken.borrow_mut().push(name.to_string());
+            Ok(())
+        };
+
+        write_state(UpdateState::Merging);
+        assert!(snaps.discard_with(&apart, &cow, &images).is_err(), "an update being merged is not given up");
+        assert_eq!(snaps.state().unwrap(), UpdateState::Merging, "the state it was left in stays");
+        assert!(dir.join(SOURCE).exists(), "and so does the slot it came from");
+        assert!(dir.join(SNAPSHOTS).join("system_b").exists(), "and its snapshot's status");
+        assert!(cow.exists() && images.exists(), "and its copy-on-write images");
+        assert!(taken.borrow().is_empty(), "nothing is taken apart");
+
+        write_state(UpdateState::Initiated);
+        snaps.write_status(&SnapshotStatus { state: PartState::Merging as i32, ..written.clone() }).unwrap();
+        assert!(snaps.discard_with(&apart, &cow, &images).is_err(), "a snapshot with a merge under way is not given up");
+        assert_eq!(snaps.state().unwrap(), UpdateState::Initiated);
+        assert!(taken.borrow().is_empty());
+        assert!(dir.join(SNAPSHOTS).join("system_b").exists());
+
+        snaps.write_status(&written).unwrap();
+        assert_eq!(snaps.discard_with(&apart, &cow, &images).unwrap(), Discarded::Update(UpdateState::Initiated));
+        assert_eq!(*taken.borrow(), ["system_b".to_string()], "the snapshot is taken apart");
+        for gone in [STATE, SOURCE, WITHOUT_SLOT_SWITCH] {
+            assert!(!dir.join(gone).exists(), "{gone} is left");
+        }
+        assert!(!dir.join(SNAPSHOTS).join("system_b").exists(), "the snapshot's status is left");
+        assert!(!cow.exists() && !images.exists(), "the copy-on-write images are left");
+        assert_eq!(snaps.state().unwrap(), UpdateState::None, "no update is left to keep an install out");
+        assert_eq!(snaps.discard_with(&apart, &cow, &images).unwrap(), Discarded::Nothing, "nothing is left to give up");
+        assert_eq!(snaps.discard_with(&apart, &cow, &images).unwrap(), Discarded::Nothing, "and giving up again changes nothing");
+        fs::remove_dir_all(&dir).unwrap();
+    }
 }
