@@ -602,7 +602,15 @@ fn update_system<S>(ctx: &mut Context, mount: &Mount<S>, update: &Update) -> Res
     if let Err(e) = remount_metadata() {
         let _ = kmsg(&format!("install: /metadata not mounted again: {e:#}"));
     }
-    Ok(match code? {
+    let code = code?;
+    if code != 0 {
+        // The engine may have stopped for want of room, leaving the update
+        // initiated and its copy-on-write images on /data, which the next
+        // install would take for one still in flight. Giving it up here lets
+        // the install be tried again at once.
+        let _ = clear_failed_update();
+    }
+    Ok(match code {
         0 => {
             if let Some(kept) = &kept {
                 reflash(ctx, kept, Ok(slot.other()));
@@ -656,6 +664,37 @@ fn remount_metadata() -> Result<()> {
         skyward_block::mount::mount_ro(&Path::new(skyward_block::BY_NAME).join("metadata"), metadata)?;
     }
     Ok(())
+}
+
+/// Give up the update a failed install left behind, so that the install can
+/// be tried again, and whether nothing is in the way any more. Only an update
+/// that was never verified or merged is given up, as Android's own recovery
+/// gives up a failed one; one that is being written on the other slot, or is
+/// merging, stays, and the install waits for it. /metadata is writable while
+/// this runs, and read-only again after.
+fn clear_failed_update() -> Result<bool> {
+    if skyward_vab::snapshot_state()? == SnapshotState::None {
+        return Ok(true);
+    }
+    let pending = skyward_vab::update()?.map(|update| update.state);
+    if !matches!(pending, Some(skyward_vab::UpdateState::Initiated | skyward_vab::UpdateState::Unverified)) {
+        return Ok(false);
+    }
+    skyward_vab::metadata_writable(true).context("make /metadata writable to give a failed update up")?;
+    let discarded = skyward_vab::discard();
+    let read_only = skyward_vab::metadata_writable(false).context("make /metadata read-only again");
+    match discarded {
+        Ok(discarded) => {
+            let _ = kmsg(&format!("install: a failed update was given up: {discarded:?}"));
+            read_only?;
+            Ok(true)
+        }
+        Err(e) => {
+            let _ = kmsg(&format!("install: a failed update was not given up: {e:#}"));
+            read_only?;
+            Ok(false)
+        }
+    }
 }
 
 /// The phone, and the system on it as its mounted partitions tell.
