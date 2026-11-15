@@ -569,8 +569,11 @@ fn update_system<S>(ctx: &mut Context, mount: &Mount<S>, update: &Update) -> Res
     if let Some(refusal) = short_of_charge(ctx.origin)? {
         return Ok(Done::Decided(Outcome::Refused(refusal)));
     }
-    let state = skyward_vab::snapshot_state()?;
-    if state != SnapshotState::None {
+    // An update a failed install left behind is given up first, so that the
+    // install can be tried again; one that Android has to merge stays, and
+    // this waits for it.
+    if !clear_failed_update()? {
+        let state = skyward_vab::snapshot_state()?;
         return Ok(Done::Decided(Outcome::Refused(Refusal::Pending(state))));
     }
     // The screen may have left the page before it heard the package came.
