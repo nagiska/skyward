@@ -5,7 +5,7 @@
 //! served by snapuserd, as compressed updates make them, are not read here.
 
 use crate::partitions::targets;
-use crate::{read_status, state_of, FailureCode, MergePhase, MergeStatus, Slot, UpdateState, UpdateStatus, OTA_DIR, SOURCE, STATE};
+use crate::{read_status, state_of, FailureCode, MergePhase, MergeStatus, NotDiscarded, Slot, UpdateState, UpdateStatus, OTA_DIR, SOURCE, STATE};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use prost::Message;
 use skyward_block::{devnum, dm, BY_NAME};
@@ -22,8 +22,9 @@ const SNAPSHOTS: &str = "snapshots";
 /// was applied from then starts through.
 const WITHOUT_SLOT_SWITCH: &str = "snapshot-boot-without-slot-switch";
 /// libfiemap's record of where the copy-on-write images lie on the data
-/// partition.
+/// partition, and the folder on it those images are kept in.
 const IMAGES: &str = "/metadata/gsi/ota/lp_metadata";
+const COW_DIR: &str = "/data/gsi/ota";
 /// The group super keeps an update's copy-on-write partitions in.
 const COW_GROUP: &str = "cow";
 
@@ -129,6 +130,16 @@ fn placed(md: &Metadata, name: &str) -> Placed {
         Some(p) if p.attributes & ATTR_UPDATED != 0 => Placed::Updated,
         Some(_) => Placed::Flashed,
     }
+}
+
+/// What giving up a failed update left.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Discarded {
+    /// There was no update to give up: none was ever written, or the one
+    /// kept is merged, completed or cancelled already.
+    Nothing,
+    /// An update in this state was given up, and is gone.
+    Update(UpdateState),
 }
 
 /// What libsnapshot keeps of an update, read and written under its lock on
@@ -319,6 +330,56 @@ impl Snapshots {
         }
         Ok(merge_percent(sum, update.sectors_allocated) / 100.0)
     }
+
+    /// Give up the update kept here where it was never verified or merged:
+    /// what is mapped of its snapshots is taken apart, and what it left on
+    /// /metadata and on the data partition is removed. An update that is
+    /// merging, or was, is not given up: its partitions may be half written,
+    /// and Android's own recovery merges it rather than throwing it away.
+    pub fn discard(&self) -> Result<Discarded> {
+        self.discard_with(&take_down, Path::new(COW_DIR), Path::new(IMAGES))
+    }
+
+    /// [`Snapshots::discard`], with what takes a partition's snapshot apart
+    /// and where the copy-on-write images are, so that files alone can stand
+    /// in for both on a computer.
+    fn discard_with(&self, apart: &dyn Fn(&str) -> Result<()>, cow: &Path, images: &Path) -> Result<Discarded> {
+        ensure!(self.exclusive, "an update is given up only under an exclusive lock");
+        let update = self.state()?;
+        match update {
+            UpdateState::None | UpdateState::MergeCompleted | UpdateState::Cancelled => return Ok(Discarded::Nothing),
+            UpdateState::Initiated | UpdateState::Unverified => {}
+            other => return Err(NotDiscarded(other).into()),
+        }
+        let dir = self.dir.join(SNAPSHOTS);
+        let names = if dir.is_dir() { self.list()? } else { Vec::new() };
+        // A snapshot being merged, or merged, is a partition half written:
+        // the update is one Android has to finish, not one to throw away.
+        for name in &names {
+            let part = self.status(name)?.part_state()?;
+            ensure!(
+                matches!(part, PartState::None | PartState::Created),
+                "{name}'s snapshot is {part:?}, so the update is being merged, or was, and is not given up"
+            );
+        }
+        for name in &names {
+            apart(name).with_context(|| format!("take {}'s snapshot apart", name))?;
+        }
+        // The images serve only the snapshots just taken apart, and go before
+        // the state that names them.
+        if cow.is_dir() {
+            fs::remove_dir_all(cow).with_context(|| format!("remove {}", cow.display()))?;
+        }
+        remove_file(images)?;
+        for name in &names {
+            remove_file(&dir.join(name))?;
+        }
+        for file in [STATE, SOURCE, WITHOUT_SLOT_SWITCH] {
+            remove_file(&self.dir.join(file))?;
+        }
+        File::open(&self.dir).and_then(|d| d.sync_all()).with_context(|| format!("sync {}", self.dir.display()))?;
+        Ok(Discarded::Update(update))
+    }
 }
 
 /// Where the bootloader is told an update in `state` stands: merging while
@@ -338,6 +399,16 @@ fn merge_status(state: UpdateState) -> MergeStatus {
 /// it.
 fn told_first(status: MergeStatus) -> bool {
     matches!(status, MergeStatus::Snapshotted | MergeStatus::Merging)
+}
+
+/// Remove `path` where it is there; the folder holding it is synced once
+/// all that the update left is gone.
+fn remove_file(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("remove {}", path.display())),
+    }
 }
 
 /// Write `data` to `path` whole or not at all: to a file beside it first,
@@ -458,6 +529,18 @@ pub fn unmap_snapshot(name: &str) -> Result<()> {
 fn delete_snapshot(name: &str) -> Result<()> {
     remove_if_mapped(&format!("{name}-cow"))?;
     remove_if_mapped(&format!("{name}-cow-img"))
+}
+
+/// Take what an update left mapped of partition `name` away where the
+/// update is given up: its snapshot and copy-on-write devices where the
+/// kernel holds a snapshot, and only those devices where the partition is
+/// mapped straight, which is not the update's to remove.
+fn take_down(name: &str) -> Result<()> {
+    if is_snapshot(name)? {
+        unmap_snapshot(name)
+    } else {
+        delete_snapshot(name)
+    }
 }
 
 /// Map partition `p` of the slot through its snapshot `status`, as the

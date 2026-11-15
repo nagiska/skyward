@@ -14,7 +14,7 @@ pub use partitions::{
     slot_sizes, snapshots_mapped, start_merge, unmap_slot, unmap_whole, unmount_one, unmount_partitions, Mounted, Mounts, SlotMaps,
     Whole,
 };
-pub use snapshots::Merge;
+pub use snapshots::{Discarded, Merge};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Slot {
@@ -247,6 +247,20 @@ pub enum Hold {
     MergeFailed,
 }
 
+/// An update that is not given up, and why: one that is being merged, or
+/// was, whose partitions may be half written, and that Android's own
+/// recovery finishes rather than throws away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NotDiscarded(pub UpdateState);
+
+impl std::fmt::Display for NotDiscarded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "an update in {:?} is not given up", self.0)
+    }
+}
+
+impl std::error::Error for NotDiscarded {}
+
 impl Update {
     /// What keeps the data partition from being erased while the phone runs
     /// from `current`, if anything. An update still being written, one the
@@ -333,6 +347,23 @@ fn state_of(status: &UpdateStatus) -> Result<UpdateState> {
 /// in flight. Callers writing to dynamic partitions must honour this.
 pub fn merge_outstanding() -> Result<bool> {
     Ok(snapshot_state()? != SnapshotState::None)
+}
+
+/// Give up the update libsnapshot keeps in /metadata, where it was never
+/// verified or merged: what is mapped of its snapshots is taken apart, and
+/// its state, its snapshots' statuses and its copy-on-write images are
+/// removed, so that an install the update kept out can be tried again.
+/// Android's own recovery does as much for a failed update that
+/// `snapshot-update cancel` gives up; one that is merging, or was, is left
+/// to Android to merge, since its partitions may be half written.
+pub fn discard() -> Result<snapshots::Discarded> {
+    if !skyward_block::mount::is_mount_point(Path::new(METADATA))? {
+        bail!("no /metadata is mounted to give an update up from");
+    }
+    match snapshots::Snapshots::lock(true)? {
+        Some(snaps) => snaps.discard(),
+        None => Ok(snapshots::Discarded::Nothing),
+    }
 }
 
 /// Where an update stands for the phone running from a slot, as a
