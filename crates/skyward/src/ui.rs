@@ -1019,12 +1019,37 @@ fn detach(services: Vec<Service>) -> Detach {
     })
 }
 
+/// The names of the links in `dir` that begin with `recovery`, sorted:
+/// what the phone's table calls the partition or partitions Skyward is
+/// kept in, said in the kernel log so that a start which offers no
+/// keeping can be told apart from one that holds no recovery at all.
+fn recovery_links(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with("recovery"))
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
 /// What an install does besides installing, as the install page's switches
 /// are set: puts Skyward back into the recovery partitions it writes over,
 /// on a phone that has them, and checks a zip's signature before its
 /// install script runs.
 fn install_options(app: &App) -> Options {
-    Options { keep: app.state.keep_recovery && app.state.recovery_partitions, signed: app.state.check_signature }
+    let keep = app.state.keep_recovery && app.state.recovery_partitions;
+    let _ = skyward_sys::kmsg(&format!(
+        "install: keeping Skyward is {}, as its switch is {} and both recovery partitions are {}",
+        if keep { "asked for" } else { "not asked for" },
+        if app.state.keep_recovery { "on" } else { "off" },
+        if app.state.recovery_partitions { "there" } else { "not both there" }
+    ));
+    Options { keep, signed: app.state.check_signature }
 }
 
 /// How often the WLAN page scans while it shows.
@@ -1353,8 +1378,19 @@ impl<'a> Pages<'a> {
         // partitions in both slots, which a switch writes.
         let by_name = Path::new(skyward_block::BY_NAME);
         let both = |base: &str| -> Result<bool> { Ok(by_name.join(format!("{base}_a")).try_exists()? && by_name.join(format!("{base}_b")).try_exists()?) };
-        app.state.recovery_partitions = both("recovery")?;
+        // What the links say, so that the kernel log tells a phone whose
+        // recovery partitions are both there from one whose links are not
+        // slotted, and every link named recovery is named, not guessed at.
+        let slotted = both("recovery")?;
+        let links = recovery_links(by_name);
+        let _ = skyward_sys::kmsg(&format!(
+            "the recovery partitions of both slots are {}; the links named recovery in {}: {links:?}",
+            if slotted { "there" } else { "not both there" },
+            by_name.display()
+        ));
+        app.state.recovery_partitions = slotted;
         app.state.dual_boot = app.state.recovery_partitions && both("boot")? && both("init_boot")?;
+        let _ = skyward_sys::kmsg(&format!("a second system is {} on this phone", if app.state.dual_boot { "held" } else { "not held" }));
         // The second system's work; the systems are read at once, for the home
         // page to name the one that starts, once a switch cut off before is
         // finished.

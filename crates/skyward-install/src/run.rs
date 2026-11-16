@@ -628,12 +628,22 @@ fn update_system<S>(ctx: &mut Context, mount: &Mount<S>, update: &Update) -> Res
 /// keep it in the recovery partitions; none when it was started without
 /// being flashed.
 fn hold(ctx: &Context, current: Slot) -> Result<Option<Kept>> {
+    // Both why it keeps nothing, said where `adb shell dmesg` reads it even
+    // when the data partition never opened: whether the install was asked
+    // to keep Skyward at all, and whether the partition of the slot the
+    // phone started from held it.
     if !ctx.options.keep {
+        let _ = kmsg("install: Skyward is not kept: the install was not asked to keep it, so the recovery partitions are left as the install leaves them");
         return Ok(None);
     }
     let kept = Kept::hold(Path::new(skyward_block::BY_NAME), current).context("hold this recovery from its partition")?;
-    if kept.is_none() {
-        let _ = kmsg("install: the recovery partition does not hold Skyward, so there is none to keep");
+    match &kept {
+        None => {
+            let _ = kmsg("install: nothing is kept: the recovery partition of the slot the phone started from does not hold Skyward");
+        }
+        Some(_) => {
+            let _ = kmsg(&format!("install: this recovery is held from slot {} to go back after the install", current.letter()));
+        }
     }
     Ok(kept)
 }
@@ -642,10 +652,27 @@ fn hold(ctx: &Context, current: Slot) -> Result<Option<Kept>> {
 /// over and into that of `next`, the slot that starts next, telling the
 /// screen how far it is and then how it went.
 fn reflash(ctx: &Context, kept: &Kept, next: Result<Slot>) {
-    let slots = match next.and_then(|next| kept.wanted(next)) {
-        Ok(slots) if slots.is_empty() => return,
+    // Each way this ends is said in the kernel log before the screen hears
+    // of it, that a recovery which came back stock says which step left it
+    // so: the slot that starts next, what the partitions hold now, and
+    // whether the write, which reads itself back, went through.
+    let next = match next {
+        Ok(next) => next,
+        Err(e) => {
+            let _ = kmsg(&format!("install: the slot that starts next is not known, so the recovery partitions were not written back: {e:#}"));
+            return ctx.send(Event::Reflashed(Reflash::Failed(format!("{e:#}"))));
+        }
+    };
+    let slots = match kept.wanted(next) {
+        Ok(slots) if slots.is_empty() => {
+            let _ = kmsg(&format!("install: no recovery partition needs Skyward written back, with slot {} starting next", next.letter()));
+            return;
+        }
         Ok(slots) => slots,
-        Err(e) => return ctx.send(Event::Reflashed(Reflash::Failed(format!("{e:#}")))),
+        Err(e) => {
+            let _ = kmsg(&format!("install: what the recovery partitions hold after the install could not be read, so none was written back: {e:#}"));
+            return ctx.send(Event::Reflashed(Reflash::Failed(format!("{e:#}"))));
+        }
     };
     let mut told: Option<Instant> = None;
     let written = kept.write(&slots, &mut |done, total| {
@@ -654,7 +681,14 @@ fn reflash(ctx: &Context, kept: &Kept, next: Result<Slot>) {
             told = Some(Instant::now());
         }
     });
-    let _ = kmsg(&format!("install: this recovery written back to {slots:?}: {written:?}"));
+    match &written {
+        Ok(()) => {
+            let _ = kmsg(&format!("install: this recovery is written back to {slots:?} and read back the same"));
+        }
+        Err(e) => {
+            let _ = kmsg(&format!("install: this recovery was not written back to {slots:?}: {e:#}"));
+        }
+    }
     ctx.send(Event::Reflashed(match written {
         Ok(()) => Reflash::Written(slots),
         Err(e) => Reflash::Failed(format!("{e:#}")),
