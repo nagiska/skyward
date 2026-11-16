@@ -1042,9 +1042,14 @@ fn recovery_links(dir: &Path) -> Vec<String> {
 /// on a phone that has them, and checks a zip's signature before its
 /// install script runs.
 fn install_options(app: &App) -> Options {
-    let keep = app.state.keep_recovery && app.state.recovery_partitions;
+    // The switch alone decides. Whether the phone has recovery partitions to
+    // keep Skyward in is the install's own to find, from the partitions
+    // themselves, and it says in the kernel log what it found; a check here
+    // could only turn the switch off without a word, as it did whenever the
+    // links this page looks for were not the ones the phone has.
+    let keep = app.state.keep_recovery;
     let _ = skyward_sys::kmsg(&format!(
-        "install: keeping Skyward is {}, as its switch is {} and both recovery partitions are {}",
+        "install: keeping Skyward is {}, as its switch is {}; the recovery partitions of both slots are {} and the install finds them itself",
         if keep { "asked for" } else { "not asked for" },
         if app.state.keep_recovery { "on" } else { "off" },
         if app.state.recovery_partitions { "there" } else { "not both there" }

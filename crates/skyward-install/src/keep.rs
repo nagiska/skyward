@@ -32,12 +32,24 @@ pub struct Kept {
 
 impl Kept {
     /// Hold this recovery from the recovery partitions among the links in
-    /// `dir`, before an install; none when the partition of the `current`
-    /// slot does not hold Skyward, as when it was started without being
-    /// flashed.
+    /// `dir`, before an install; none when the phone has no partition of
+    /// that name for both slots, and none when the partition of the
+    /// `current` slot does not hold Skyward, as when it was started
+    /// without being flashed.
     pub fn hold(dir: &Path, current: Slot) -> Result<Option<Kept>> {
-        let (a, image_a) = read(&image::device(dir, PARTITION, Slot::A))?;
-        let (b, image_b) = read(&image::device(dir, PARTITION, Slot::B))?;
+        // A phone whose recovery lives elsewhere, or one whose links are
+        // not the ones this names, has no partition to keep Skyward in:
+        // that is nothing to keep, not a failure, and it is said here
+        // rather than turned off ahead of the install without a word.
+        let paths = [image::device(dir, PARTITION, Slot::A), image::device(dir, PARTITION, Slot::B)];
+        for path in &paths {
+            if !path.try_exists().with_context(|| format!("look for {}", path.display()))? {
+                let _ = kmsg(&format!("keep: {} is not there, so there is no recovery partition to keep Skyward in and none is kept", path.display()));
+                return Ok(None);
+            }
+        }
+        let (a, image_a) = read(&paths[0])?;
+        let (b, image_b) = read(&paths[1])?;
         let (held, image) = match current {
             Slot::A => (a, image_a),
             Slot::B => (b, image_b),
@@ -178,6 +190,16 @@ mod tests {
         assert_eq!(std::fs::read(dir.path().join("recovery_a")).unwrap(), whole);
         assert!(kept.wanted(Slot::A).unwrap().is_empty());
         assert_eq!(kept.wanted(Slot::B).unwrap(), [Slot::B], "an install that has slot B start next");
+    }
+
+    #[test]
+    fn nothing_is_kept_where_a_recovery_partition_is_not_there() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("recovery_b"), recovery(true)).unwrap();
+        assert!(Kept::hold(dir.path(), Slot::A).unwrap().is_none(), "the partition of slot A is not there");
+        assert!(Kept::hold(dir.path(), Slot::B).unwrap().is_none(), "nor is the one of the other slot, which is read too");
+        std::fs::write(dir.path().join("recovery_a"), recovery(true)).unwrap();
+        assert!(Kept::hold(dir.path(), Slot::B).unwrap().is_some(), "both are there, and slot B holds Skyward");
     }
 
     #[test]
