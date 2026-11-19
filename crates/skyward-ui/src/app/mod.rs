@@ -715,7 +715,7 @@ const FOLD_FADE_DP: f32 = 26.0;
 const FOLD_SETTLE: f32 = 0.5;
 const FOLD_PERIOD: f32 = 0.354;
 /// How far, in dp, a swipe from an edge has to come in to go back.
-const BACK_SWIPE_DP: f32 = 56.0;
+const BACK_SWIPE_DP: f32 = 40.0;
 /// The back cue sits this far, in dp, above where the finger came down,
 /// and stays at that height however the finger then wanders.
 const CUE_LIFT_DP: f32 = 9.0;

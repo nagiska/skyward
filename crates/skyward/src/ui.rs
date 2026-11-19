@@ -189,6 +189,19 @@ fn power(target: Target) -> Result<()> {
     })
 }
 
+/// Put the radio away before the recovery stops.
+///
+/// The WLAN's thread is told to end, and it ends by setting the switch the
+/// start set back, letting the chip go of its firmware, and taking the driver
+/// out of the kernel. A chip left running is one the system's own driver finds
+/// already up as it boots and will not start cold: no interface appears, the
+/// WLAN stays dead until the phone loses its power.
+fn put_radio_away(wlan: &mut Option<wlan::Worker>) {
+    if let Some(worker) = wlan.take() {
+        worker.stop();
+    }
+}
+
 /// File transfer: the service offering internal storage to a computer over
 /// USB, whether it offers the storage now, and the zone, by its place in
 /// the settings, it tells the times of files in.
@@ -1006,12 +1019,42 @@ fn detach(services: Vec<Service>) -> Detach {
     })
 }
 
+/// The names of the links in `dir` that begin with `recovery`, sorted:
+/// what the phone's table calls the partition or partitions Skyward is
+/// kept in, said in the kernel log so that a start which offers no
+/// keeping can be told apart from one that holds no recovery at all.
+fn recovery_links(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with("recovery"))
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
 /// What an install does besides installing, as the install page's switches
 /// are set: puts Skyward back into the recovery partitions it writes over,
 /// on a phone that has them, and checks a zip's signature before its
 /// install script runs.
 fn install_options(app: &App) -> Options {
-    Options { keep: app.state.keep_recovery && app.state.recovery_partitions, signed: app.state.check_signature }
+    // The switch alone decides. Whether the phone has recovery partitions to
+    // keep Skyward in is the install's own to find, from the partitions
+    // themselves, and it says in the kernel log what it found; a check here
+    // could only turn the switch off without a word, as it did whenever the
+    // links this page looks for were not the ones the phone has.
+    let keep = app.state.keep_recovery;
+    let _ = skyward_sys::kmsg(&format!(
+        "install: keeping Skyward is {}, as its switch is {}; the recovery partitions of both slots are {} and the install finds them itself",
+        if keep { "asked for" } else { "not asked for" },
+        if app.state.keep_recovery { "on" } else { "off" },
+        if app.state.recovery_partitions { "there" } else { "not both there" }
+    ));
+    Options { keep, signed: app.state.check_signature }
 }
 
 /// How often the WLAN page scans while it shows.
@@ -1340,8 +1383,19 @@ impl<'a> Pages<'a> {
         // partitions in both slots, which a switch writes.
         let by_name = Path::new(skyward_block::BY_NAME);
         let both = |base: &str| -> Result<bool> { Ok(by_name.join(format!("{base}_a")).try_exists()? && by_name.join(format!("{base}_b")).try_exists()?) };
-        app.state.recovery_partitions = both("recovery")?;
+        // What the links say, so that the kernel log tells a phone whose
+        // recovery partitions are both there from one whose links are not
+        // slotted, and every link named recovery is named, not guessed at.
+        let slotted = both("recovery")?;
+        let links = recovery_links(by_name);
+        let _ = skyward_sys::kmsg(&format!(
+            "the recovery partitions of both slots are {}; the links named recovery in {}: {links:?}",
+            if slotted { "there" } else { "not both there" },
+            by_name.display()
+        ));
+        app.state.recovery_partitions = slotted;
         app.state.dual_boot = app.state.recovery_partitions && both("boot")? && both("init_boot")?;
+        let _ = skyward_sys::kmsg(&format!("a second system is {} on this phone", if app.state.dual_boot { "held" } else { "not held" }));
         // The second system's work; the systems are read at once, for the home
         // page to name the one that starts, once a switch cut off before is
         // finished.
@@ -1558,6 +1612,7 @@ impl<'a> Pages<'a> {
         let now = monotonic_ms();
         if self.leave_at.is_some_and(|at| now >= at) {
             self.leave_at = None;
+            put_radio_away(&mut self.wlan);
             power(self.leave)?;
         }
         if !self.touch_known && self.started.elapsed() >= TOUCH_WAIT {
@@ -1931,6 +1986,7 @@ impl Pages<'_> {
                     if again {
                         bcb::write(&self.misc, &bcb::Bcb { command: "boot-rescue".into(), args: Vec::new() })?;
                     }
+                    put_radio_away(&mut self.wlan);
                     power(target)?;
                 }
             }
@@ -2164,6 +2220,7 @@ impl Pages<'_> {
                     }
                     self.switch_asked = false;
                     self.switched = true;
+                    put_radio_away(&mut self.wlan);
                     power(Target::System)?;
                 }
                 systems::Event::Failed(why) => {
@@ -2480,6 +2537,10 @@ impl Pages<'_> {
             // still kept in misc asked.
             Effect::Reboot(target) => {
                 self.done_with_request()?;
+                // The radio goes away before the phone does: a chip left
+                // running is one the system's own driver finds already up as
+                // it boots and will not start cold.
+                put_radio_away(&mut self.wlan);
                 power(target)?
             }
             Effect::Dismiss => self.done_with_request()?,

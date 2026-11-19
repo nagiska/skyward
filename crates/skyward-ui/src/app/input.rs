@@ -40,7 +40,9 @@ impl App {
         self.stir(now);
         let t = self.theme();
         let m = t.m;
-        let (slop, edge) = (m.dp(8.0), m.dp(20.0));
+        // The edge band is kept wide: a finger landing near the glass, or a
+        // panel whose very edge reports late, still starts the swipe back.
+        let (slop, edge) = (m.dp(8.0), m.dp(40.0));
         let scroll = self.top().1;
         let mut fx = Vec::new();
         let pressing = self.pressing();

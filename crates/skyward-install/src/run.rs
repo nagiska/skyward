@@ -7,6 +7,7 @@
 use crate::adb::{self, Connection, Offer, Service};
 use crate::asked::Asked;
 use crate::blockmap::BlockMap;
+use crate::engine::{engine_lines, wait_engine};
 use crate::ffs::{Endpoints, Shared, Usb};
 use crate::fuse::{self, Fault, LocalFile, Mount};
 use crate::image::{self, ImageKind};
@@ -28,6 +29,7 @@ use std::os::unix::fs::{symlink, PermissionsExt};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::thread;
@@ -41,9 +43,13 @@ pub type Detach = Box<dyn FnOnce() -> Result<()> + Send>;
 const METADATA: &str = "/metadata";
 const DATA: &str = "/data";
 
-/// Where a zip's install script is put to run, as Android's recovery puts
-/// it, and the version of the interface the script is told it runs under.
-const BINARY: &str = "/tmp/update-binary";
+/// Where a zip's install script is put to run, and the version of the
+/// interface the script is told it runs under. Android's recovery puts it in
+/// /tmp, which is where a script goes looking for what it copied there; but a
+/// script that clears /tmp before it starts would take the binary running it
+/// down with the rest, so it is kept beside the recovery's own logs, which
+/// nothing a package runs is told about.
+const BINARY: &str = "/skyward/run/update-binary";
 const API_VERSION: &str = "3";
 const RETRY: &str = "retry";
 
@@ -563,8 +569,11 @@ fn update_system<S>(ctx: &mut Context, mount: &Mount<S>, update: &Update) -> Res
     if let Some(refusal) = short_of_charge(ctx.origin)? {
         return Ok(Done::Decided(Outcome::Refused(refusal)));
     }
-    let state = skyward_vab::snapshot_state()?;
-    if state != SnapshotState::None {
+    // An update a failed install left behind is given up first, so that the
+    // install can be tried again; one that Android has to merge stays, and
+    // this waits for it.
+    if !clear_failed_update()? {
+        let state = skyward_vab::snapshot_state()?;
         return Ok(Done::Decided(Outcome::Refused(Refusal::Pending(state))));
     }
     // The screen may have left the page before it heard the package came.
@@ -596,7 +605,15 @@ fn update_system<S>(ctx: &mut Context, mount: &Mount<S>, update: &Update) -> Res
     if let Err(e) = remount_metadata() {
         let _ = kmsg(&format!("install: /metadata not mounted again: {e:#}"));
     }
-    Ok(match code? {
+    let code = code?;
+    if code != 0 {
+        // The engine may have stopped for want of room, leaving the update
+        // initiated and its copy-on-write images on /data, which the next
+        // install would take for one still in flight. Giving it up here lets
+        // the install be tried again at once.
+        let _ = clear_failed_update();
+    }
+    Ok(match code {
         0 => {
             if let Some(kept) = &kept {
                 reflash(ctx, kept, Ok(slot.other()));
@@ -611,12 +628,22 @@ fn update_system<S>(ctx: &mut Context, mount: &Mount<S>, update: &Update) -> Res
 /// keep it in the recovery partitions; none when it was started without
 /// being flashed.
 fn hold(ctx: &Context, current: Slot) -> Result<Option<Kept>> {
+    // Both why it keeps nothing, said where `adb shell dmesg` reads it even
+    // when the data partition never opened: whether the install was asked
+    // to keep Skyward at all, and whether the partition of the slot the
+    // phone started from held it.
     if !ctx.options.keep {
+        let _ = kmsg("install: Skyward is not kept: the install was not asked to keep it, so the recovery partitions are left as the install leaves them");
         return Ok(None);
     }
     let kept = Kept::hold(Path::new(skyward_block::BY_NAME), current).context("hold this recovery from its partition")?;
-    if kept.is_none() {
-        let _ = kmsg("install: the recovery partition does not hold Skyward, so there is none to keep");
+    match &kept {
+        None => {
+            let _ = kmsg("install: nothing is kept: the recovery partition of the slot the phone started from does not hold Skyward");
+        }
+        Some(_) => {
+            let _ = kmsg(&format!("install: this recovery is held from slot {} to go back after the install", current.letter()));
+        }
     }
     Ok(kept)
 }
@@ -625,10 +652,27 @@ fn hold(ctx: &Context, current: Slot) -> Result<Option<Kept>> {
 /// over and into that of `next`, the slot that starts next, telling the
 /// screen how far it is and then how it went.
 fn reflash(ctx: &Context, kept: &Kept, next: Result<Slot>) {
-    let slots = match next.and_then(|next| kept.wanted(next)) {
-        Ok(slots) if slots.is_empty() => return,
+    // Each way this ends is said in the kernel log before the screen hears
+    // of it, that a recovery which came back stock says which step left it
+    // so: the slot that starts next, what the partitions hold now, and
+    // whether the write, which reads itself back, went through.
+    let next = match next {
+        Ok(next) => next,
+        Err(e) => {
+            let _ = kmsg(&format!("install: the slot that starts next is not known, so the recovery partitions were not written back: {e:#}"));
+            return ctx.send(Event::Reflashed(Reflash::Failed(format!("{e:#}"))));
+        }
+    };
+    let slots = match kept.wanted(next) {
+        Ok(slots) if slots.is_empty() => {
+            let _ = kmsg(&format!("install: no recovery partition needs Skyward written back, with slot {} starting next", next.letter()));
+            return;
+        }
         Ok(slots) => slots,
-        Err(e) => return ctx.send(Event::Reflashed(Reflash::Failed(format!("{e:#}")))),
+        Err(e) => {
+            let _ = kmsg(&format!("install: what the recovery partitions hold after the install could not be read, so none was written back: {e:#}"));
+            return ctx.send(Event::Reflashed(Reflash::Failed(format!("{e:#}"))));
+        }
     };
     let mut told: Option<Instant> = None;
     let written = kept.write(&slots, &mut |done, total| {
@@ -637,7 +681,14 @@ fn reflash(ctx: &Context, kept: &Kept, next: Result<Slot>) {
             told = Some(Instant::now());
         }
     });
-    let _ = kmsg(&format!("install: this recovery written back to {slots:?}: {written:?}"));
+    match &written {
+        Ok(()) => {
+            let _ = kmsg(&format!("install: this recovery is written back to {slots:?} and read back the same"));
+        }
+        Err(e) => {
+            let _ = kmsg(&format!("install: this recovery was not written back to {slots:?}: {e:#}"));
+        }
+    }
     ctx.send(Event::Reflashed(match written {
         Ok(()) => Reflash::Written(slots),
         Err(e) => Reflash::Failed(format!("{e:#}")),
@@ -650,6 +701,37 @@ fn remount_metadata() -> Result<()> {
         skyward_block::mount::mount_ro(&Path::new(skyward_block::BY_NAME).join("metadata"), metadata)?;
     }
     Ok(())
+}
+
+/// Give up the update a failed install left behind, so that the install can
+/// be tried again, and whether nothing is in the way any more. Only an update
+/// that was never verified or merged is given up, as Android's own recovery
+/// gives up a failed one; one that is being written on the other slot, or is
+/// merging, stays, and the install waits for it. /metadata is writable while
+/// this runs, and read-only again after.
+fn clear_failed_update() -> Result<bool> {
+    if skyward_vab::snapshot_state()? == SnapshotState::None {
+        return Ok(true);
+    }
+    let pending = skyward_vab::update()?.map(|update| update.state);
+    if !matches!(pending, Some(skyward_vab::UpdateState::Initiated | skyward_vab::UpdateState::Unverified)) {
+        return Ok(false);
+    }
+    skyward_vab::metadata_writable(true).context("make /metadata writable to give a failed update up")?;
+    let discarded = skyward_vab::discard();
+    let read_only = skyward_vab::metadata_writable(false).context("make /metadata read-only again");
+    match discarded {
+        Ok(discarded) => {
+            let _ = kmsg(&format!("install: a failed update was given up: {discarded:?}"));
+            read_only?;
+            Ok(true)
+        }
+        Err(e) => {
+            let _ = kmsg(&format!("install: a failed update was not given up: {e:#}"));
+            read_only?;
+            Ok(false)
+        }
+    }
 }
 
 /// The phone, and the system on it as its mounted partitions tell.
@@ -682,7 +764,7 @@ enum Line {
 
 /// Run update_engine on the package, telling the screen how far it is,
 /// and give its exit code.
-fn apply<S>(ctx: &Context, mount: &Mount<S>, update: &Update) -> Result<i32> {
+fn apply<S>(ctx: &Context, _mount: &Mount<S>, update: &Update) -> Result<i32> {
     let (status_read, status_write) = pipe()?;
     let status_fd = status_write.as_raw_fd();
     let mut command = std::process::Command::new(ota::PROGRAM);
@@ -705,18 +787,25 @@ fn apply<S>(ctx: &Context, mount: &Mount<S>, update: &Update) -> Result<i32> {
     let stderr = child.stderr.take().expect("stderr is piped");
     let mut log = File::create(ENGINE_LOG).with_context(|| format!("create {ENGINE_LOG}"))?;
 
+    // Both pipes are read until they are told to stop. A helper the engine
+    // starts inherits them, and one that serves the snapshots of the slot
+    // outlives the engine: a reader that waited for the pipe itself to close
+    // would keep the install from ever ending.
+    let stop = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
     let status_tx = tx.clone();
+    let status_stop = stop.clone();
     let status = thread::spawn(move || {
-        lines(File::from(status_read), |line| {
+        engine_lines(File::from(status_read), &status_stop, |line| {
             if let Some(s) = ota::status(line) {
                 let _ = status_tx.send(Line::Status(s));
             }
             Ok(())
         })
     });
+    let log_stop = stop.clone();
     let logged = thread::spawn(move || {
-        lines(stderr, |line| {
+        engine_lines(stderr, &log_stop, |line| {
             if let Some(l) = ota::log(line) {
                 let _ = tx.send(Line::Log(l));
             }
@@ -728,24 +817,29 @@ fn apply<S>(ctx: &Context, mount: &Mount<S>, update: &Update) -> Result<i32> {
     let mut stage = Stage::Writing { done: 0, total };
     ctx.send(Event::Progress(stage.clone()));
     let mut told = Instant::now();
-    let (mut partitions, mut verifying, mut finishing, mut error) = (0, None, false, None);
-    loop {
-        match rx.recv_timeout(PROGRESS_EVERY) {
-            Ok(Line::Status(Status::Step(step))) => finishing = step == 2,
-            Ok(Line::Status(Status::Error(code))) => error = Some(code),
-            Ok(Line::Log(Log::Partition(_))) => partitions += 1,
-            Ok(Line::Log(Log::Overwriting)) => ctx.send(Event::Overwriting),
-            Ok(Line::Log(Log::Hashing { index, partition })) => verifying = Some((index, partition)),
-            Err(RecvTimeoutError::Timeout) => {}
-            // Both outputs closed: the program has ended.
-            Err(RecvTimeoutError::Disconnected) => break,
+    let (mut partitions, mut verifying, mut finishing, mut error, mut progress) = (0, None, false, None, None);
+    let mut receive = |line| {
+        match line {
+            Line::Status(Status::Step(step)) => finishing = step == 2,
+            Line::Status(Status::Progress(value)) | Line::Log(Log::Progress(value)) => {
+                // The engine's own count, never how far into the package
+                // something has read: the zip's directory is at its end and
+                // is read before any of it is applied.
+                if !finishing && verifying.is_none() {
+                    progress = Some(progress.unwrap_or(0).max(value));
+                }
+            }
+            Line::Status(Status::Error(code)) => error = Some(code),
+            Line::Log(Log::Partition(_)) => partitions += 1,
+            Line::Log(Log::Overwriting) => ctx.send(Event::Overwriting),
+            Line::Log(Log::Hashing { index, partition }) => verifying = Some((index, partition)),
         }
         let now = if finishing {
             Stage::Finishing
         } else if let Some((index, partition)) = &verifying {
             Stage::Verifying { index: *index, count: partitions.max(index + 1), partition: partition.clone() }
         } else {
-            Stage::Writing { done: mount.served().saturating_sub(update.payload_offset).min(total), total }
+            Stage::Writing { done: total.saturating_mul(u64::from(progress.unwrap_or(0))) / 1000, total }
         };
         let moved_on = std::mem::discriminant(&now) != std::mem::discriminant(&stage);
         if now != stage && (moved_on || told.elapsed() >= PROGRESS_EVERY) {
@@ -753,10 +847,19 @@ fn apply<S>(ctx: &Context, mount: &Mount<S>, update: &Update) -> Result<i32> {
             ctx.send(Event::Progress(stage.clone()));
             told = Instant::now();
         }
-    }
-    let ended = child.wait().context("wait for update_engine")?;
+    };
+    let ended = wait_engine(&mut child, &rx, &mut receive);
+    // The engine has ended, or waiting on it failed. Reading stops here; what
+    // is already in the pipes is handed over below, and a helper still
+    // holding one is left alone.
+    stop.store(true, Ordering::Relaxed);
     status.join().expect("the status reader does not panic").context("read update_engine's status")?;
     logged.join().expect("the log reader does not panic").context("read update_engine's log")?;
+    for line in rx.try_iter() {
+        receive(line);
+    }
+    let ended = ended?;
+    let _ = kmsg(&format!("install: update_engine ended with {ended}, having reported {error:?}"));
     match (ended.code(), error) {
         (_, Some(code)) => Ok(code),
         (Some(code), None) => Ok(code),

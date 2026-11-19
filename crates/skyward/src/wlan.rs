@@ -4,7 +4,7 @@
 //! stand each time that changes.
 
 use anyhow::{bail, ensure, Context, Result};
-use skyward_config::{Firmware, Wlan as Config};
+use skyward_config::{Firmware, Setting, Wlan as Config};
 use skyward_net::dhcp::{self, Kept, Lease};
 use skyward_net::http::Servers;
 use skyward_net::iface;
@@ -15,7 +15,7 @@ use skyward_sys::worker::{self, Teller};
 use std::fs;
 use std::net::Ipv4Addr;
 use std::os::fd::RawFd;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as Process, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -44,6 +44,10 @@ const INTERFACE_WAIT: Duration = Duration::from_secs(20);
 
 /// How long the supplicant may take to open its control socket.
 const SOCKET_WAIT: Duration = Duration::from_secs(10);
+
+/// How long the driver is given to stop the chip once the switch is set back,
+/// before it is asked to leave the kernel.
+const PUT_AWAY_WAIT: Duration = Duration::from_millis(300);
 
 /// How long the supplicant gets to end once asked to.
 const END_WAIT: Duration = Duration::from_secs(3);
@@ -132,6 +136,17 @@ impl Worker {
             }
         }
         (wlan, traffic)
+    }
+}
+
+impl Worker {
+    /// Put the radio away now, and wait for the thread to have done it: the
+    /// thread is the only one that can stop the chip's firmware and take the
+    /// driver out of the kernel. The drop below sends the end again and waits
+    /// for the thread, which is what makes the put-away complete before a
+    /// caller goes on to restart the phone.
+    pub fn stop(self) {
+        self.inbox.tell(Inbox::End);
     }
 }
 
@@ -334,11 +349,17 @@ impl Station {
 
     fn off(&mut self) {
         self.unaddress();
+        // Whether there is a driver to take out at all: a WLAN that never
+        // came up has nothing to put away, and its switch need not be there.
+        let driving = self.running.is_some() || Path::new("/sys/class/net").join(&self.cfg.interface).exists();
         if let Some(mut r) = self.running.take() {
             end(&mut r.child, Some(&r.control));
         }
         if let Err(e) = iface::set_up(&self.cfg.interface, false) {
             let _ = skyward_sys::kmsg(&format!("{e:#}"));
+        }
+        if driving {
+            put_away(&self.cfg);
         }
         self.state = Wlan::default();
     }
@@ -620,6 +641,45 @@ impl Station {
     }
 }
 
+/// Put the radio away the way the phone's own init does as it goes down: the
+/// switch the start set set back the other way, which has the driver stop the
+/// chip's firmware, and then the driver itself out of the kernel. A chip left
+/// running is one the system's own driver finds already up when it boots: it
+/// will not start it cold, no interface appears, and the WLAN stays dead
+/// until the phone loses power. Nothing here may fail the WLAN's own ending,
+/// so a switch that will not take its value and a module the kernel will not
+/// let go are said, and no more.
+fn put_away(cfg: &Config) {
+    for w in &cfg.release {
+        if let Err(e) = fs::write(&w.path, &w.value) {
+            let _ = skyward_sys::kmsg(&format!("{} is not given {}: {e}", w.path, w.value));
+        }
+    }
+    if !cfg.release.is_empty() {
+        thread::sleep(PUT_AWAY_WAIT);
+    }
+    let mut why = None;
+    for attempt in 0..3 {
+        match skyward_modules::unload(&cfg.modules) {
+            Ok(gone) => {
+                if !gone.is_empty() {
+                    let _ = skyward_sys::kmsg(&format!("{} left the kernel", gone.join(", ")));
+                }
+                return;
+            }
+            Err(e) => {
+                why = Some(format!("{e:#}"));
+                if attempt < 2 {
+                    thread::sleep(PUT_AWAY_WAIT);
+                }
+            }
+        }
+    }
+    if let Some(why) = why {
+        let _ = skyward_sys::kmsg(&format!("the driver stays in the kernel: {why}"));
+    }
+}
+
 /// Load the driver where its interface is not there yet, and bring the
 /// interface up.
 fn bring_up(cfg: &Config, modules: &[PathBuf]) -> Result<()> {
@@ -651,15 +711,73 @@ fn place(file: &Firmware) -> Result<()> {
     let bytes = match &file.partition {
         None => fs::read(&file.path).with_context(|| format!("read {}", file.path))?,
         Some(partition) => {
-            let at = Path::new(PARTITIONS).join(partition);
-            fs::create_dir_all(&at).with_context(|| format!("make {}", at.display()))?;
-            skyward_block::mount::mount_ro(&Path::new(skyward_block::BY_NAME).join(partition), &at)?;
+            let device = Path::new(skyward_block::BY_NAME).join(partition);
+            let number = fs::metadata(&device).with_context(|| format!("look at {}", device.display()))?.rdev();
+            // A partition the phone's own table already has mounted, as the
+            // one holding the radio's calibration is, is read where it is: a
+            // second mount would be refused as busy.
+            let already = skyward_block::mount::points_of((
+                libc::major(number as libc::dev_t) as u32,
+                libc::minor(number as libc::dev_t) as u32,
+            ))?
+            .into_iter()
+            .next();
+            let temporary = already.is_none();
+            let at = match already {
+                Some(at) => at,
+                None => {
+                    let at = Path::new(PARTITIONS).join(partition);
+                    fs::create_dir_all(&at).with_context(|| format!("make {}", at.display()))?;
+                    skyward_block::mount::mount_ro(&device, &at)?;
+                    at
+                }
+            };
             let read = fs::read(at.join(&file.path)).with_context(|| format!("read {} on {partition}", file.path));
-            skyward_block::mount::umount(&at)?;
+            if temporary {
+                skyward_block::mount::umount(&at)?;
+            }
             read?
         }
     };
+    let bytes = with_settings(bytes, &file.settings).with_context(|| format!("change the settings in {}", file.path))?;
     fs::write(&to, bytes).with_context(|| format!("write {}", to.display()))
+}
+
+/// Put values into a firmware configuration before the marker where its
+/// parser stops, replacing values the stock file already sets.
+fn with_settings(bytes: Vec<u8>, settings: &[Setting]) -> Result<Vec<u8>> {
+    if settings.is_empty() {
+        return Ok(bytes);
+    }
+    let text = String::from_utf8(bytes).context("read a firmware configuration as text")?;
+    let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut lines = text.split_inclusive('\n').map(str::to_owned).collect::<Vec<_>>();
+    for setting in settings {
+        let assignment = format!("{} = {}", setting.name, setting.value);
+        let mut replaced = false;
+        for line in &mut lines {
+            let ending = if line.ends_with("\r\n") {
+                "\r\n"
+            } else if line.ends_with('\n') {
+                "\n"
+            } else {
+                ""
+            };
+            let content = line.trim_end_matches(['\r', '\n']).trim();
+            if content.split_once('=').is_some_and(|(name, _)| name.trim() == setting.name) {
+                *line = format!("{assignment}{ending}");
+                replaced = true;
+            }
+        }
+        if !replaced {
+            if lines.last().is_some_and(|line| !line.ends_with('\n')) {
+                lines.last_mut().expect("the last line is there").push_str(newline);
+            }
+            let at = lines.iter().position(|line| line.trim() == "END").unwrap_or(lines.len());
+            lines.insert(at, format!("{assignment}{newline}"));
+        }
+    }
+    Ok(lines.concat().into_bytes())
 }
 
 /// Start the supplicant on the interface, and wait for its control socket.
@@ -721,4 +839,27 @@ fn end(child: &mut Child, control: Option<&Control>) {
     }
     let _ = child.kill();
     let _ = child.wait();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::with_settings;
+    use skyward_config::Setting;
+
+    fn setting(name: &str, value: &str) -> Setting {
+        Setting { name: name.into(), value: value.into() }
+    }
+
+    #[test]
+    fn settings_replace_stock_values_and_stay_before_the_end() {
+        let config = b"alpha = 1\r\nbeta = 2\r\nEND\r\nafter\r\n".to_vec();
+        let changed = with_settings(config, &[setting("beta", "9"), setting("gamma", "3")]).unwrap();
+        assert_eq!(changed, b"alpha = 1\r\nbeta = 9\r\ngamma = 3\r\nEND\r\nafter\r\n");
+    }
+
+    #[test]
+    fn settings_append_to_a_configuration_without_an_end() {
+        let changed = with_settings(b"alpha=1".to_vec(), &[setting("beta", "2")]).unwrap();
+        assert_eq!(changed, b"alpha=1\nbeta = 2\n");
+    }
 }

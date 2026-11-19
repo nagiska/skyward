@@ -331,7 +331,7 @@ impl Modprobe {
         let module = canonical(path).unwrap_or_default();
         let options = self.options.get(&module).cloned().unwrap_or_default();
         let file = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path).with_context(|| format!("open {path}"))?;
-        match crate::finit_module(&file, &options) {
+        match crate::finit_module(&file, std::path::Path::new(path), &options) {
             Ok(()) => self.count += 1,
             Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {}
             Err(e) => return Err(e).with_context(|| format!("load {path} with {options:?}")),

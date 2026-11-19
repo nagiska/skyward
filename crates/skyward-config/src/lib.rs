@@ -110,6 +110,11 @@ pub struct Wlan {
     /// what tells a platform driver it may start the chip.
     #[serde(default)]
     pub writes: Vec<Write>,
+    /// What is written when the WLAN is put away, each value to its file:
+    /// the switch above set back, so that the driver stops the chip rather
+    /// than leaving it running for whatever the phone boots next.
+    #[serde(default)]
+    pub release: Vec<Write>,
     /// Files the driver asks the kernel's firmware loader for that are not
     /// where the loader looks in a recovery.
     #[serde(default)]
@@ -158,9 +163,22 @@ pub struct Firmware {
     /// of `partition`.
     pub path: String,
     /// A partition the recovery does not keep mounted, which is mounted
-    /// read-only while the file is read.
+    /// read-only while the file is read; one it already has mounted is used
+    /// where it is.
     #[serde(default)]
     pub partition: Option<String>,
+    /// Values to give the file's parser, replacing a value it already has
+    /// or added before its `END` marker.
+    #[serde(default)]
+    pub settings: Vec<Setting>,
+}
+
+/// A value in a firmware configuration file, such as how long a driver
+/// waits for userspace to bring its interface up.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Setting {
+    pub name: String,
+    pub value: String,
 }
 
 /// The phone maker's update server, which the stock updater asks about the
@@ -598,6 +616,18 @@ impl DeviceConfig {
                     }
                     None => ensure!(path.is_absolute(), "[wlan] firmware: {} is not an absolute path", file.path),
                 }
+                for setting in &file.settings {
+                    ensure!(
+                        !setting.name.is_empty() && setting.name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'),
+                        "[wlan] firmware: {:?} is not a setting's name",
+                        setting.name
+                    );
+                    ensure!(
+                        !setting.value.contains(['\n', '\r']),
+                        "[wlan] firmware: {} is set over more than one line",
+                        setting.name
+                    );
+                }
             }
         }
         Ok(cfg)
@@ -788,7 +818,7 @@ mod tests {
             (include_str!("../../../devices/houji.toml"), "OS3.0.307.0.WNCCNXM"),
             (include_str!("../../../devices/shennong.toml"), "OS3.0.309.0.WNBCNXM"),
             (include_str!("../../../devices/aurora.toml"), "OS3.0.308.0.WNACNXM"),
-            (include_str!("../../../devices/dada.toml"), "OS3.0.307.0.WOCCNXM"),
+            (include_str!("../../../devices/dada.toml"), "OS4.0.4.0.XOCCNXM"),
             (include_str!("../../../devices/haotian.toml"), "OS3.0.309.0.WOBCNXM"),
             (include_str!("../../../devices/xuanyuan.toml"), "OS3.0.314.0.WOACNXM"),
             (include_str!("../../../devices/byron.toml"), "OS3.0.310.0.WAFCNXM"),
@@ -929,11 +959,26 @@ mod tests {
         let with = |file: &str| DeviceConfig::parse(&format!("{base}firmware = [{file}]\n"));
         assert!(with("{ name = \"wlan/a.ini\", path = \"/vendor/etc/a.ini\" }").is_ok());
         assert!(with("{ name = \"wlan/mac.bin\", partition = \"persist\", path = \"kiwi/mac.bin\" }").is_ok());
+        assert!(with("{ name = \"wlan/a.ini\", path = \"/vendor/etc/a.ini\", settings = [{ name = \"wait\", value = \"0\" }] }").is_ok());
         assert!(with("{ name = \"/etc/firmware/a.ini\", path = \"/vendor/etc/a.ini\" }").is_err());
         assert!(with("{ name = \"../a.ini\", path = \"/vendor/etc/a.ini\" }").is_err());
         assert!(with("{ name = \"a.ini\", path = \"vendor/etc/a.ini\" }").is_err());
         assert!(with("{ name = \"mac.bin\", partition = \"persist\", path = \"/kiwi/mac.bin\" }").is_err());
         assert!(with("{ name = \"mac.bin\", partition = \"by-name/persist\", path = \"mac.bin\" }").is_err());
+        assert!(with("{ name = \"wlan/a.ini\", path = \"/vendor/a.ini\", settings = [{ name = \"a=b\", value = \"0\" }] }").is_err());
+        assert!(with("{ name = \"wlan/a.ini\", path = \"/vendor/a.ini\", settings = [{ name = \"wait\", value = \"two\\nlines\" }] }").is_err());
+    }
+
+    #[test]
+    fn dada_waits_for_the_recovery_to_start_its_supplicant() {
+        let cfg = DeviceConfig::parse(include_str!("../../../devices/dada.toml")).unwrap();
+        let wlan = cfg.wlan.expect("the phone's WLAN is described");
+        let settings = wlan.firmware.iter().filter(|f| f.name.ends_with("WCNSS_qcom_cfg.ini")).flat_map(|f| &f.settings).collect::<Vec<_>>();
+        assert!(!settings.is_empty(), "its Peach driver is told to wait");
+        assert!(
+            settings.iter().all(|s| s.name == "gInterfaceChangeWait" && s.value == "0"),
+            "the chip does not power down before wpa_supplicant opens its interface"
+        );
     }
 
     #[test]
