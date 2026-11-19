@@ -100,8 +100,6 @@ the fixes listed in the
 its end-to-end verification is in progress, and dual boot is not tried yet.
 The dada work is built on upstream main and reported in that release.
 
-汇报模型：qwen4-max-preview（custom-qwen）　日期：2026-11-19
-
 ### 🚧 Under construction
 
 These images are built from each phone's stock firmware and have not been tried
