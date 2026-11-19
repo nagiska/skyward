@@ -91,6 +91,16 @@ read and set properties.
 | --- | --- | --- |
 | Xiaomi 17 Ultra | `nezha` | OS4.0.4.0.XPACNXM (Android 17) |
 | Xiaomi 13 Ultra | `ishtar` | OS3.0.308.0.WMACNXM (Android 16) |
+| Xiaomi 15 | `dada` | OS4.0.4.0.XOCCNXM (Android 17) |
+
+On the Xiaomi 15, the screen, touch, WLAN and data decryption with the
+screen-lock credential are verified on the phone. The install/OTA path carries
+the fixes listed in the
+[dada release](https://github.com/nagiska/skyward/releases/tag/dada-OS4.0.4.0-20261119);
+its end-to-end verification is in progress, and dual boot is not tried yet.
+The dada work is built on upstream main and reported in that release.
+
+汇报模型：qwen4-max-preview（custom-qwen）　日期：2026-11-19
 
 ### 🚧 Under construction
 
@@ -108,7 +118,6 @@ not been verified.
 | 🚧 Xiaomi 14 | `houji` | OS3.0.307.0.WNCCNXM (Android 16) |
 | 🚧 Xiaomi 14 Pro | `shennong` | OS3.0.309.0.WNBCNXM (Android 16) |
 | 🚧 Xiaomi 14 Ultra | `aurora` | OS3.0.308.0.WNACNXM (Android 16) |
-| 🚧 Xiaomi 15 | `dada` | OS4.0.4.0.XOCCNXM (Android 17) |
 | 🚧 Xiaomi 15 Pro | `haotian` | OS3.0.309.0.WOBCNXM (Android 16) |
 | 🚧 Xiaomi 15 Ultra | `xuanyuan` | OS3.0.314.0.WOACNXM (Android 16) |
 | 🚧 Xiaomi 17 | `pudding` | OS4.0.4.0.XPCCNXM (Android 17) |
